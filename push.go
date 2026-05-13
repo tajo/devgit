@@ -104,7 +104,7 @@ func runPush(args []string) error {
 
 	author := localGitAuthor(root)
 	if author != nil {
-		fmt.Printf("  author: %s <%s>\n", author.Name, author.Email)
+		fmt.Printf("  co-author: %s <%s>\n", author.Name, author.Email)
 	}
 
 	newSHA, err := buildSignedCommit(ctx, client, owner, repo, baseSHA, description, changes, root, author)
@@ -275,17 +275,17 @@ func buildSignedCommit(
 		return "", fmt.Errorf("create tree: %w", err)
 	}
 
+	// Author & Committer are intentionally omitted: GitHub only auto-signs
+	// commits where BOTH default to the authenticated App identity. Setting
+	// Author=user makes GitHub copy that into Committer too, which skips
+	// the auto-sign path and causes "Commits must have verified signatures"
+	// rules to reject the resulting ref update. We surface the local user
+	// via a Co-Authored-By trailer instead — same PR attribution, signing
+	// preserved.
 	newCommit := github.Commit{
-		Message: github.String(message),
+		Message: github.String(withCoAuthorTrailer(message, author)),
 		Tree:    tree,
 		Parents: []*github.Commit{{SHA: github.String(baseSHA)}},
-	}
-	if author != nil {
-		newCommit.Author = &github.CommitAuthor{
-			Name:  github.String(author.Name),
-			Email: github.String(author.Email),
-			Date:  &github.Timestamp{Time: time.Now()},
-		}
 	}
 	commit, _, err := client.Git.CreateCommit(ctx, owner, repo, newCommit, nil)
 	if err != nil {
@@ -416,4 +416,18 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// withCoAuthorTrailer appends a `Co-Authored-By:` trailer to the commit
+// message. GitHub parses these trailers (when separated from the body by a
+// blank line) and shows the named identity as a contributor on the PR and
+// commit view, with their avatar. This preserves human attribution while
+// keeping the commit's Author/Committer as the App so server-side signing
+// still fires.
+func withCoAuthorTrailer(message string, author *commitAuthor) string {
+	if author == nil {
+		return message
+	}
+	trimmed := strings.TrimRight(message, "\n")
+	return fmt.Sprintf("%s\n\nCo-Authored-By: %s <%s>\n", trimmed, author.Name, author.Email)
 }
