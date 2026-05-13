@@ -6,22 +6,24 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
-	"github.com/google/go-github/v66/github"
+	"github.com/google/go-github/v84/github"
 )
 
 // --- GitHub App credentials --------------------------------------------------
 //
-// Hardcoded for now per the bootstrap brief. Replace the zero values once the
-// real App is provisioned. The private key must be the full PEM contents
-// (including the BEGIN/END lines), copy-pasted into the backticked string.
+// The PEM path is hardcoded rather than embedded so the secret never ends up
+// in source control. ghinstallation v2 still wants the numeric App ID for the
+// JWT `iss` claim; the Client ID is kept for reference / future migration when
+// the library accepts string identifiers.
 const (
-	githubAppID         int64 = 0 // TODO: set GitHub App ID
-	githubInstallID     int64 = 0 // TODO: set GitHub App Installation ID for the target org/user
-	githubAppPrivateKey       = `` // TODO: paste full PEM (-----BEGIN ... END-----)
+	githubAppID             int64 = 3694599
+	githubAppClientID             = "Iv23li8LdX9JSdjo8q0z"
+	githubAppPrivateKeyPath       = "/Users/vojtech/Downloads/devgit-go.2026-05-12.private-key.pem"
 )
 
 // Base branch the PR targets. Most repos use "main"; flip to "master" if the
@@ -30,17 +32,25 @@ const (
 const defaultBaseBranch = "main"
 
 func runPush(args []string) error {
-	if len(args) < 2 {
-		return errors.New("usage: devgit push <branch> <description>")
+	if len(args) == 0 {
+		return errors.New("usage: devgit push [<branch>] <description>")
 	}
-	branch := args[0]
-	description := strings.Join(args[1:], " ")
 
 	if err := validateAppConfig(); err != nil {
 		return err
 	}
 
 	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+
+	cur, err := currentBranch(root)
+	if err != nil {
+		return err
+	}
+
+	branch, description, err := resolveBranchAndDescription(args, cur)
 	if err != nil {
 		return err
 	}
@@ -69,12 +79,35 @@ func runPush(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	client, err := newAppClient()
+	client, err := newInstallClient(ctx, owner, repo)
 	if err != nil {
 		return err
 	}
 
-	newSHA, err := buildSignedCommit(ctx, client, owner, repo, baseSHA, description, changes, root)
+	// Decide whether we're creating a new branch or extending one we already
+	// own. Either way, refuse to silently force-push over remote history.
+	remoteTip, remoteExists, err := remoteBranchTip(ctx, client, owner, repo, branch)
+	if err != nil {
+		return err
+	}
+	if remoteExists {
+		if cur != branch {
+			return fmt.Errorf("branch %s already exists on origin; "+
+				"check it out first to extend its PR, or pick a new name", branch)
+		}
+		if remoteTip != baseSHA {
+			return fmt.Errorf("local %s is at %s but origin/%s is at %s; "+
+				"`git fetch && git pull` before pushing",
+				branch, shortSHA(baseSHA), branch, shortSHA(remoteTip))
+		}
+	}
+
+	author := localGitAuthor(root)
+	if author != nil {
+		fmt.Printf("  co-author: %s <%s>\n", author.Name, author.Email)
+	}
+
+	newSHA, err := buildSignedCommit(ctx, client, owner, repo, baseSHA, description, changes, root, author)
 	if err != nil {
 		return err
 	}
@@ -83,13 +116,22 @@ func runPush(args []string) error {
 	if err := upsertBranch(ctx, client, owner, repo, branch, newSHA); err != nil {
 		return err
 	}
-	fmt.Printf("✓ branch %s now points at %s\n", branch, shortSHA(newSHA))
+	if remoteExists {
+		fmt.Printf("✓ branch %s advanced to %s (was %s)\n",
+			branch, shortSHA(newSHA), shortSHA(remoteTip))
+	} else {
+		fmt.Printf("✓ branch %s created at %s\n", branch, shortSHA(newSHA))
+	}
 
-	pr, err := ensurePullRequest(ctx, client, owner, repo, branch, defaultBaseBranch, description)
+	pr, created, err := ensurePullRequest(ctx, client, owner, repo, branch, defaultBaseBranch, description)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("✓ pull request: %s\n", pr.GetHTMLURL())
+	if created {
+		fmt.Printf("✓ opened pull request: %s\n", pr.GetHTMLURL())
+	} else {
+		fmt.Printf("✓ extended existing pull request: %s\n", pr.GetHTMLURL())
+	}
 
 	if err := syncLocalToRemote(root, branch); err != nil {
 		return fmt.Errorf("local sync to %s: %w", branch, err)
@@ -99,34 +141,90 @@ func runPush(args []string) error {
 	return nil
 }
 
+// resolveBranchAndDescription disambiguates the two CLI shapes:
+//
+//	devgit push <description>              → branch = current
+//	devgit push <branch> <description>     → branch = explicit
+//
+// In the 1-arg form we refuse to commit to the base branch — that would
+// turn `devgit push` into a way to commit directly to main, bypassing PR
+// review, which is the opposite of what this tool exists for.
+func resolveBranchAndDescription(args []string, current string) (branch, description string, err error) {
+	if len(args) == 1 {
+		if current == defaultBaseBranch {
+			return "", "", fmt.Errorf("you're on %s; pass a target branch: "+
+				"devgit push <branch> %q", defaultBaseBranch, args[0])
+		}
+		return current, args[0], nil
+	}
+	return args[0], strings.Join(args[1:], " "), nil
+}
+
 func validateAppConfig() error {
-	if githubAppID == 0 || githubInstallID == 0 || strings.TrimSpace(githubAppPrivateKey) == "" {
+	if githubAppID == 0 || strings.TrimSpace(githubAppPrivateKeyPath) == "" {
 		return errors.New("GitHub App credentials are not set: edit push.go constants " +
-			"(githubAppID, githubInstallID, githubAppPrivateKey) before using devgit")
+			"(githubAppID, githubAppPrivateKeyPath) before using devgit")
+	}
+	if _, err := os.Stat(githubAppPrivateKeyPath); err != nil {
+		return fmt.Errorf("private key not readable at %s: %w", githubAppPrivateKeyPath, err)
 	}
 	return nil
 }
 
-// newAppClient builds a go-github client whose underlying transport mints
-// fresh installation tokens from the App's private key.
-func newAppClient() (*github.Client, error) {
-	tr, err := ghinstallation.New(http.DefaultTransport, githubAppID, githubInstallID,
-		[]byte(githubAppPrivateKey))
+// newInstallClient mints an installation-scoped go-github client for the
+// given repo. It does the two-step App auth dance: build a JWT-signed
+// AppsTransport from the private key, ask GitHub which installation owns
+// (owner, repo), then convert to an installation-token transport so the
+// returned client can read and write that repo.
+func newInstallClient(ctx context.Context, owner, repo string) (*github.Client, error) {
+	keyBytes, err := os.ReadFile(githubAppPrivateKeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("init github app transport: %w", err)
+		return nil, fmt.Errorf("read app private key: %w", err)
 	}
-	return github.NewClient(&http.Client{Transport: tr}), nil
+
+	atr, err := ghinstallation.NewAppsTransport(http.DefaultTransport, githubAppID, keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("init github apps transport: %w", err)
+	}
+
+	appClient := github.NewClient(&http.Client{Transport: atr})
+	install, _, err := appClient.Apps.FindRepositoryInstallation(ctx, owner, repo)
+	if err != nil {
+		return nil, fmt.Errorf("find app installation for %s/%s "+
+			"(install the app on this repo at https://github.com/settings/installations): %w",
+			owner, repo, err)
+	}
+
+	itr := ghinstallation.NewFromAppsTransport(atr, install.GetID())
+
+	// Narrow the access token to (a) just this one repo and (b) the minimum
+	// permissions a push needs. The App may be installed across many repos
+	// with broader permissions; the token GitHub mints for this process can
+	// only ever touch <owner>/<repo>, only for Contents + Pull requests.
+	// Leaking the in-memory token in this state can't escalate beyond that.
+	itr.InstallationTokenOptions = &github.InstallationTokenOptions{
+		Repositories: []string{repo},
+		Permissions: &github.InstallationPermissions{
+			Contents:     github.String("write"),
+			PullRequests: github.String("write"),
+		},
+	}
+
+	return github.NewClient(&http.Client{Transport: itr}), nil
 }
 
 // buildSignedCommit uploads blobs for every changed file, derives a new tree
 // from the base commit's tree, then creates a commit. Because the commit is
-// authored via App credentials, GitHub auto-signs it server-side.
+// committed via App credentials, GitHub auto-signs it server-side. The
+// author, when provided, is stamped onto the commit so the PR shows the
+// human's identity while still benefiting from the App's verified signature.
 func buildSignedCommit(
 	ctx context.Context,
 	client *github.Client,
 	owner, repo, baseSHA, message string,
 	changes []change,
 	root string,
+	author *commitAuthor,
 ) (string, error) {
 	baseCommit, _, err := client.Git.GetCommit(ctx, owner, repo, baseSHA)
 	if err != nil {
@@ -156,7 +254,7 @@ func buildSignedCommit(
 		// Always upload as base64 — handles binary files and avoids encoding
 		// gotchas with arbitrary text. The API accepts either content or
 		// encoding+content; we keep one path for simplicity.
-		blob, _, err := client.Git.CreateBlob(ctx, owner, repo, &github.Blob{
+		blob, _, err := client.Git.CreateBlob(ctx, owner, repo, github.Blob{
 			Content:  github.String(base64.StdEncoding.EncodeToString(content)),
 			Encoding: github.String("base64"),
 		})
@@ -177,31 +275,56 @@ func buildSignedCommit(
 		return "", fmt.Errorf("create tree: %w", err)
 	}
 
-	commit, _, err := client.Git.CreateCommit(ctx, owner, repo, &github.Commit{
-		Message: github.String(message),
+	// Author & Committer are intentionally omitted: GitHub only auto-signs
+	// commits where BOTH default to the authenticated App identity. Setting
+	// Author=user makes GitHub copy that into Committer too, which skips
+	// the auto-sign path and causes "Commits must have verified signatures"
+	// rules to reject the resulting ref update. We surface the local user
+	// via a Co-Authored-By trailer instead — same PR attribution, signing
+	// preserved.
+	newCommit := github.Commit{
+		Message: github.String(withCoAuthorTrailer(message, author)),
 		Tree:    tree,
 		Parents: []*github.Commit{{SHA: github.String(baseSHA)}},
-	}, nil)
+	}
+	commit, _, err := client.Git.CreateCommit(ctx, owner, repo, newCommit, nil)
 	if err != nil {
 		return "", fmt.Errorf("create commit: %w", err)
 	}
 	return commit.GetSHA(), nil
 }
 
-// upsertBranch creates refs/heads/<branch> at sha, or force-updates it if it
-// already exists. We force here because the branch is intended to be owned
-// by devgit-driven flows; in a real multi-writer setting we'd add a
-// `--force-with-lease`-style compare-and-swap.
+// remoteBranchTip reads the current tip SHA of refs/heads/<branch> on the
+// remote. Returns (sha, true, nil) if the branch exists, ("", false, nil)
+// if not, and surfaces any other API error.
+func remoteBranchTip(
+	ctx context.Context,
+	client *github.Client,
+	owner, repo, branch string,
+) (string, bool, error) {
+	ref, resp, err := client.Git.GetRef(ctx, owner, repo, "heads/"+branch)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("read remote ref %s: %w", branch, err)
+	}
+	return ref.GetObject().GetSHA(), true, nil
+}
+
+// upsertBranch creates refs/heads/<branch> at sha, or fast-forwards it if
+// the branch already exists. We use force=false so GitHub rejects the
+// update if some other writer advanced the branch in between our sync
+// check and this call — equivalent to `git push --force-with-lease`.
 func upsertBranch(
 	ctx context.Context,
 	client *github.Client,
 	owner, repo, branch, sha string,
 ) error {
-	ref := &github.Reference{
-		Ref:    github.String("refs/heads/" + branch),
-		Object: &github.GitObject{SHA: github.String(sha)},
-	}
-	_, _, err := client.Git.CreateRef(ctx, owner, repo, ref)
+	_, _, err := client.Git.CreateRef(ctx, owner, repo, github.CreateRef{
+		Ref: "refs/heads/" + branch,
+		SHA: sha,
+	})
 	if err == nil {
 		return nil
 	}
@@ -210,33 +333,42 @@ func upsertBranch(
 	if !errors.As(err, &errResp) || errResp.Response.StatusCode != http.StatusUnprocessableEntity {
 		return fmt.Errorf("create ref: %w", err)
 	}
-	if _, _, err := client.Git.UpdateRef(ctx, owner, repo, ref, true); err != nil {
-		return fmt.Errorf("update ref: %w", err)
+	_, _, err = client.Git.UpdateRef(ctx, owner, repo, "heads/"+branch, github.UpdateRef{
+		SHA:   sha,
+		Force: github.Bool(false),
+	})
+	if err != nil {
+		return fmt.Errorf("update ref (non-fast-forward? someone else may have pushed): %w", err)
 	}
 	return nil
 }
 
-// ensurePullRequest opens a PR or returns the existing open PR for head→base.
+// ensurePullRequest opens a PR or, if one already exists for head→base,
+// returns it untouched. The created return value lets the caller report
+// "opened" vs "extended" so the user can see what actually happened.
+//
+// We never edit the title/body of an existing PR — each push's description
+// is the commit message for that push, not a rewrite of the PR summary.
 func ensurePullRequest(
 	ctx context.Context,
 	client *github.Client,
 	owner, repo, branch, base, description string,
-) (*github.PullRequest, error) {
+) (pr *github.PullRequest, created bool, err error) {
 	title := firstLine(description)
-	pr, _, err := client.PullRequests.Create(ctx, owner, repo, &github.NewPullRequest{
+	pr, _, err = client.PullRequests.Create(ctx, owner, repo, &github.NewPullRequest{
 		Title: github.String(title),
 		Head:  github.String(branch),
 		Base:  github.String(base),
 		Body:  github.String(description),
 	})
 	if err == nil {
-		return pr, nil
+		return pr, true, nil
 	}
 
 	// If a PR already exists for this head, GitHub returns 422. Look it up.
 	var errResp *github.ErrorResponse
 	if !errors.As(err, &errResp) || errResp.Response.StatusCode != http.StatusUnprocessableEntity {
-		return nil, fmt.Errorf("create pull request: %w", err)
+		return nil, false, fmt.Errorf("create pull request: %w", err)
 	}
 	prs, _, listErr := client.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{
 		State: "open",
@@ -244,12 +376,12 @@ func ensurePullRequest(
 		Base:  base,
 	})
 	if listErr != nil {
-		return nil, fmt.Errorf("create pull request: %w (and list fallback failed: %v)", err, listErr)
+		return nil, false, fmt.Errorf("create pull request: %w (and list fallback failed: %v)", err, listErr)
 	}
 	if len(prs) == 0 {
-		return nil, fmt.Errorf("create pull request: %w", err)
+		return nil, false, fmt.Errorf("create pull request: %w", err)
 	}
-	return prs[0], nil
+	return prs[0], false, nil
 }
 
 // syncLocalToRemote fetches the freshly-pushed branch and moves the local
@@ -284,4 +416,18 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// withCoAuthorTrailer appends a `Co-Authored-By:` trailer to the commit
+// message. GitHub parses these trailers (when separated from the body by a
+// blank line) and shows the named identity as a contributor on the PR and
+// commit view, with their avatar. This preserves human attribution while
+// keeping the commit's Author/Committer as the App so server-side signing
+// still fires.
+func withCoAuthorTrailer(message string, author *commitAuthor) string {
+	if author == nil {
+		return message
+	}
+	trimmed := strings.TrimRight(message, "\n")
+	return fmt.Sprintf("%s\n\nCo-Authored-By: %s <%s>\n", trimmed, author.Name, author.Email)
 }
