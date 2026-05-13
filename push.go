@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -15,13 +16,14 @@ import (
 
 // --- GitHub App credentials --------------------------------------------------
 //
-// Hardcoded for now per the bootstrap brief. Replace the zero values once the
-// real App is provisioned. The private key must be the full PEM contents
-// (including the BEGIN/END lines), copy-pasted into the backticked string.
+// The PEM path is hardcoded rather than embedded so the secret never ends up
+// in source control. ghinstallation v2 still wants the numeric App ID for the
+// JWT `iss` claim; the Client ID is kept for reference / future migration when
+// the library accepts string identifiers.
 const (
-	githubAppID         int64 = 0 // TODO: set GitHub App ID
-	githubInstallID     int64 = 0 // TODO: set GitHub App Installation ID for the target org/user
-	githubAppPrivateKey       = `` // TODO: paste full PEM (-----BEGIN ... END-----)
+	githubAppID             int64 = 3694599
+	githubAppClientID             = "Iv23li8LdX9JSdjo8q0z"
+	githubAppPrivateKeyPath       = "/Users/vojtech/Downloads/devgit-go.2026-05-12.private-key.pem"
 )
 
 // Base branch the PR targets. Most repos use "main"; flip to "master" if the
@@ -69,7 +71,7 @@ func runPush(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	client, err := newAppClient()
+	client, err := newInstallClient(ctx, owner, repo)
 	if err != nil {
 		return err
 	}
@@ -100,22 +102,42 @@ func runPush(args []string) error {
 }
 
 func validateAppConfig() error {
-	if githubAppID == 0 || githubInstallID == 0 || strings.TrimSpace(githubAppPrivateKey) == "" {
+	if githubAppID == 0 || strings.TrimSpace(githubAppPrivateKeyPath) == "" {
 		return errors.New("GitHub App credentials are not set: edit push.go constants " +
-			"(githubAppID, githubInstallID, githubAppPrivateKey) before using devgit")
+			"(githubAppID, githubAppPrivateKeyPath) before using devgit")
+	}
+	if _, err := os.Stat(githubAppPrivateKeyPath); err != nil {
+		return fmt.Errorf("private key not readable at %s: %w", githubAppPrivateKeyPath, err)
 	}
 	return nil
 }
 
-// newAppClient builds a go-github client whose underlying transport mints
-// fresh installation tokens from the App's private key.
-func newAppClient() (*github.Client, error) {
-	tr, err := ghinstallation.New(http.DefaultTransport, githubAppID, githubInstallID,
-		[]byte(githubAppPrivateKey))
+// newInstallClient mints an installation-scoped go-github client for the
+// given repo. It does the two-step App auth dance: build a JWT-signed
+// AppsTransport from the private key, ask GitHub which installation owns
+// (owner, repo), then convert to an installation-token transport so the
+// returned client can read and write that repo.
+func newInstallClient(ctx context.Context, owner, repo string) (*github.Client, error) {
+	keyBytes, err := os.ReadFile(githubAppPrivateKeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("init github app transport: %w", err)
+		return nil, fmt.Errorf("read app private key: %w", err)
 	}
-	return github.NewClient(&http.Client{Transport: tr}), nil
+
+	atr, err := ghinstallation.NewAppsTransport(http.DefaultTransport, githubAppID, keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("init github apps transport: %w", err)
+	}
+
+	appClient := github.NewClient(&http.Client{Transport: atr})
+	install, _, err := appClient.Apps.FindRepositoryInstallation(ctx, owner, repo)
+	if err != nil {
+		return nil, fmt.Errorf("find app installation for %s/%s "+
+			"(install the app on this repo at https://github.com/settings/installations): %w",
+			owner, repo, err)
+	}
+
+	itr := ghinstallation.NewFromAppsTransport(atr, install.GetID())
+	return github.NewClient(&http.Client{Transport: itr}), nil
 }
 
 // buildSignedCommit uploads blobs for every changed file, derives a new tree
