@@ -39,9 +39,14 @@ func usage() {
 	fmt.Fprint(os.Stderr, `devgit — create signed commits & PRs via a GitHub App
 
 Usage:
-  devgit push <branch> <description>
+  devgit push [<branch>] <description>
+
+If <branch> is omitted, the currently checked-out branch is used (not allowed
+on the base branch). The first push to a branch opens a PR; subsequent pushes
+to the same branch append commits to the existing PR.
 
 Examples:
-  devgit push feature/login "Add login form"
+  devgit push feature/login "Add login form"   # first push: creates branch + PR
+  devgit push "Fix login validation"           # extends current branch's PR
 `)
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -36,6 +37,46 @@ func headSHA(root string) (string, error) {
 		return "", fmt.Errorf("read HEAD: %w", err)
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// currentBranch returns the short name of the currently checked-out branch
+// (e.g. "feature/login"). Errors if HEAD is detached, since there is no
+// meaningful branch to push to in that state.
+func currentBranch(root string) (string, error) {
+	out, err := runGit(root, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("read current branch: %w", err)
+	}
+	b := strings.TrimSpace(out)
+	if b == "HEAD" || b == "" {
+		return "", errors.New("HEAD is detached; checkout a branch first")
+	}
+	return b, nil
+}
+
+// localGitAuthor reads `user.name` and `user.email` from git config (which
+// merges system / global / repo-local levels). Returns nil if either is
+// unset, so callers can fall back cleanly to the App's identity.
+func localGitAuthor(root string) *commitAuthor {
+	name, errN := runGit(root, "config", "user.name")
+	email, errE := runGit(root, "config", "user.email")
+	if errN != nil || errE != nil {
+		return nil
+	}
+	n := strings.TrimSpace(name)
+	e := strings.TrimSpace(email)
+	if n == "" || e == "" {
+		return nil
+	}
+	return &commitAuthor{Name: n, Email: e}
+}
+
+// commitAuthor holds the human identity to stamp onto created commits.
+// Committer is intentionally separate (and left default) so GitHub still
+// signs the commit as the App, which is what produces the Verified badge.
+type commitAuthor struct {
+	Name  string
+	Email string
 }
 
 // originOwnerRepo parses the `origin` remote URL and returns (owner, repo).
