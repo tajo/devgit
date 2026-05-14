@@ -1,0 +1,2 @@
+Second marker file — exercises the chain walker on a fresh branch
+from main, distinct from sign-test.
