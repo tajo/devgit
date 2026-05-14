@@ -1,0 +1,24 @@
+{
+  "name": "devgit-server",
+  "version": "0.0.1",
+  "description": "Signs commits via GitHub App for the devgit CLI",
+  "private": true,
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "dev": "node --env-file-if-exists=.env --import tsx --watch src/index.ts"
+  },
+  "dependencies": {
+    "@octokit/app": "15.1.0",
+    "express": "4.21.2",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.0",
+    "@types/node": "22.9.0",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3"
+  }
+}

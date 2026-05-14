@@ -2,24 +2,12 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 )
-
-// change describes a single file delta in the working tree relative to HEAD.
-type change struct {
-	// path is the repo-root-relative POSIX path.
-	path string
-	// deleted is true if the file no longer exists in the working tree.
-	deleted bool
-	// mode is the git file mode, e.g. "100644" or "100755". Ignored when deleted.
-	mode string
-}
 
 // repoRoot returns the absolute path of the enclosing git repo.
 func repoRoot() (string, error) {
@@ -30,50 +18,116 @@ func repoRoot() (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-// headSHA returns the current HEAD commit SHA.
-func headSHA(root string) (string, error) {
-	out, err := runGit(root, "rev-parse", "HEAD")
+// commitInfo describes a single commit in enough detail for the server's
+// /commits/sign endpoint to recreate it. Sig is git's `%G?` status:
+//
+//	N - no signature                  (needs replacement)
+//	B - bad signature                 (needs replacement)
+//	G - good signature, trusted key   (verified)
+//	U - good signature, untrusted key (verified — App signatures usually land here)
+//	X - good, but expired             (needs replacement)
+//	Y - good, but key expired         (needs replacement)
+//	R - good, but key revoked         (needs replacement)
+//	E - cannot verify (missing key)   (needs replacement, to be safe)
+type commitInfo struct {
+	SHA     string
+	Tree    string
+	Parents []string
+	Message string
+	Sig     string
+}
+
+// isVerified returns true if a `%G?` status character is one that GitHub's
+// branch-protection "require signed commits" rule would accept. Locally we
+// only see G or U for valid signatures (the App's signature shows as U on
+// most machines because the App's key isn't in the user's keyring).
+func isVerified(status string) bool {
+	return status == "G" || status == "U"
+}
+
+// upstreamMergeBase returns the SHA of the most recent common ancestor of
+// HEAD and the tracked upstream branch. Falls back to origin/<fallback> if
+// HEAD has no upstream configured (e.g., a brand-new local branch).
+func upstreamMergeBase(root, fallback string) (string, error) {
+	if out, err := runGit(root, "merge-base", "HEAD", "@{upstream}"); err == nil {
+		return strings.TrimSpace(out), nil
+	}
+	fallbackRef := "origin/" + fallback
+	out, err := runGit(root, "merge-base", "HEAD", fallbackRef)
 	if err != nil {
-		return "", fmt.Errorf("read HEAD: %w", err)
+		return "", fmt.Errorf("no upstream tracked and could not merge-base against %s: %w", fallbackRef, err)
 	}
 	return strings.TrimSpace(out), nil
 }
 
-// currentBranch returns the short name of the currently checked-out branch
-// (e.g. "feature/login"). Errors if HEAD is detached, since there is no
-// meaningful branch to push to in that state.
-func currentBranch(root string) (string, error) {
-	out, err := runGit(root, "rev-parse", "--abbrev-ref", "HEAD")
+// commitsBetween returns the commits in the half-open range (from, to] in
+// oldest-first order, fully populated with tree/parents/message/signature.
+//
+// The single git-log invocation uses `-z` to put NULs *between* records,
+// and `%x00` to put NULs *between* fields within each record. So output is
+// one flat NUL-delimited stream: each commit contributes exactly 5 fields,
+// in the order SHA, tree, parents, sig, message.
+func commitsBetween(root, from, to string) ([]commitInfo, error) {
+	rng := fmt.Sprintf("%s..%s", from, to)
+	out, err := runGit(root, "log", "--reverse", "-z",
+		"--format=%H%x00%T%x00%P%x00%G?%x00%B", rng)
 	if err != nil {
-		return "", fmt.Errorf("read current branch: %w", err)
+		return nil, fmt.Errorf("list commits %s: %w", rng, err)
 	}
-	b := strings.TrimSpace(out)
-	if b == "HEAD" || b == "" {
-		return "", errors.New("HEAD is detached; checkout a branch first")
+	if out == "" {
+		return nil, nil
 	}
-	return b, nil
+
+	fields := strings.Split(out, "\x00")
+	if len(fields) > 0 && fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
+	}
+	if len(fields)%5 != 0 {
+		return nil, fmt.Errorf("unexpected git log output: got %d fields, want multiple of 5", len(fields))
+	}
+
+	commits := make([]commitInfo, 0, len(fields)/5)
+	for i := 0; i < len(fields); i += 5 {
+		commits = append(commits, commitInfo{
+			SHA:     fields[i],
+			Tree:    fields[i+1],
+			Parents: strings.Fields(fields[i+2]),
+			Sig:     fields[i+3],
+			Message: strings.TrimRight(fields[i+4], "\n"),
+		})
+	}
+	return commits, nil
 }
 
-// localGitAuthor reads `user.name` and `user.email` from git config (which
-// merges system / global / repo-local levels). Returns nil if either is
-// unset, so callers can fall back cleanly to the App's identity.
+// localGitAuthor returns the author identity git would stamp on a new
+// commit (merging system / global / repo-local config). `git var
+// GIT_AUTHOR_IDENT` resolves both name and email in one subprocess and
+// applies git's own validation; if either is missing it exits non-zero
+// and we fall back to nil so the caller can use the App's identity.
+//
+// Output format: `Name <email> <unix-timestamp> <tz>`.
 func localGitAuthor(root string) *commitAuthor {
-	name, errN := runGit(root, "config", "user.name")
-	email, errE := runGit(root, "config", "user.email")
-	if errN != nil || errE != nil {
+	out, err := runGit(root, "var", "GIT_AUTHOR_IDENT")
+	if err != nil {
 		return nil
 	}
-	n := strings.TrimSpace(name)
-	e := strings.TrimSpace(email)
-	if n == "" || e == "" {
+	s := strings.TrimSpace(out)
+	emailStart := strings.LastIndex(s, " <")
+	emailEnd := strings.LastIndex(s, "> ")
+	if emailStart < 0 || emailEnd <= emailStart {
 		return nil
 	}
-	return &commitAuthor{Name: n, Email: e}
+	name := strings.TrimSpace(s[:emailStart])
+	email := s[emailStart+2 : emailEnd]
+	if name == "" || email == "" {
+		return nil
+	}
+	return &commitAuthor{Name: name, Email: email}
 }
 
-// commitAuthor holds the human identity to stamp onto created commits.
-// Committer is intentionally separate (and left default) so GitHub still
-// signs the commit as the App, which is what produces the Verified badge.
+// commitAuthor holds the human identity surfaced via a Co-Authored-By trailer.
+// Author/Committer on the actual commit stay as the App (default) so GitHub
+// auto-signs it server-side.
 type commitAuthor struct {
 	Name  string
 	Email string
@@ -92,7 +146,6 @@ func originOwnerRepo(root string) (string, string, error) {
 	var path string
 	switch {
 	case strings.HasPrefix(raw, "git@"):
-		// git@github.com:owner/repo.git
 		_, after, ok := strings.Cut(raw, ":")
 		if !ok {
 			return "", "", fmt.Errorf("unrecognized ssh remote %q", raw)
@@ -116,95 +169,20 @@ func originOwnerRepo(root string) (string, string, error) {
 	return owner, repo, nil
 }
 
-// collectChanges returns every file that differs from HEAD: staged,
-// unstaged, and untracked (but not ignored). It ignores submodules.
-func collectChanges(root string) ([]change, error) {
-	// -z: NUL-terminated records; the only safe format for arbitrary paths.
-	// --untracked-files=all: include each untracked file, not just the dir.
-	// --no-renames: treat rename as delete+add so paths line up with HEAD blobs.
-	out, err := runGit(root, "status", "--porcelain=v1", "-z",
-		"--untracked-files=all", "--no-renames", "--ignored=no")
-	if err != nil {
-		return nil, fmt.Errorf("git status: %w", err)
-	}
-
-	var changes []change
-	seen := make(map[string]bool)
-
-	// Each record: "XY path\x00". A status code never contains NUL.
-	for _, rec := range strings.Split(out, "\x00") {
-		if len(rec) < 4 {
-			continue
-		}
-		code := rec[:2]
-		path := rec[3:]
-		if seen[path] {
-			continue
-		}
-		seen[path] = true
-
-		// Skip unmerged entries — there's nothing sensible we can push.
-		if strings.ContainsAny(code, "U") || code == "DD" || code == "AA" {
-			return nil, fmt.Errorf("path %q has merge conflicts; resolve before pushing", path)
-		}
-
-		deleted := code[0] == 'D' || code[1] == 'D'
-		if deleted {
-			changes = append(changes, change{path: path, deleted: true})
-			continue
-		}
-
-		mode, err := workingTreeMode(root, path)
-		if err != nil {
-			return nil, err
-		}
-		changes = append(changes, change{path: path, mode: mode})
-	}
-
-	return changes, nil
-}
-
-// workingTreeMode returns the git mode string for a file on disk.
-func workingTreeMode(root, path string) (string, error) {
-	abs := filepath.Join(root, path)
-	info, err := os.Lstat(abs)
-	if err != nil {
-		return "", fmt.Errorf("stat %s: %w", path, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return "120000", nil
-	}
-	if info.Mode()&0o111 != 0 {
-		return "100755", nil
-	}
-	return "100644", nil
-}
-
-// readBlob returns the raw bytes of a file in the working tree. Symlinks
-// are returned as the link target (matching git's blob storage for mode 120000).
-func readBlob(root, path string) ([]byte, error) {
-	abs := filepath.Join(root, path)
-	info, err := os.Lstat(abs)
-	if err != nil {
-		return nil, fmt.Errorf("stat %s: %w", path, err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(abs)
-		if err != nil {
-			return nil, fmt.Errorf("readlink %s: %w", path, err)
-		}
-		return []byte(target), nil
-	}
-	return os.ReadFile(abs)
-}
-
-// runGit invokes `git` with the given args inside dir. If dir is empty
-// the inherited working directory is used.
-func runGit(dir string, args ...string) (string, error) {
+// gitCommand builds an *exec.Cmd for `git <args>` rooted at dir (empty =
+// inherit cwd). Callers attach stdout/stderr and call Run themselves.
+func gitCommand(dir string, args ...string) *exec.Cmd {
 	cmd := exec.Command("git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	return cmd
+}
+
+// runGit runs git and returns captured stdout. On failure the returned
+// error contains git's stderr verbatim so the caller can surface it.
+func runGit(dir string, args ...string) (string, error) {
+	cmd := gitCommand(dir, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -218,13 +196,10 @@ func runGit(dir string, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
-// runGitInherit runs git and streams output to the user's terminal. Used
-// for fetch / reset where the user benefits from seeing progress.
+// runGitInherit runs git and streams its stdout/stderr to the user's
+// terminal. For fetch / reset / push where progress matters.
 func runGitInherit(dir string, args ...string) error {
-	cmd := exec.Command("git", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
+	cmd := gitCommand(dir, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
